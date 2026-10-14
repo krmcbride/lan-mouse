@@ -540,6 +540,10 @@ impl State {
             log::info!(" * {output}");
         }
 
+        // Every window is recreated below. Release the grab first so it
+        // cannot outlive the focused window's surface.
+        self.ungrab();
+        self.focused = None;
         self.active_windows.clear();
 
         let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
@@ -764,7 +768,10 @@ impl Dispatch<WlPointer, ()> for State {
                 button,
                 state,
             } => {
-                let window = app.focused.as_ref().unwrap();
+                // events queued before the focused window was destroyed
+                let Some(window) = app.focused.as_ref() else {
+                    return;
+                };
                 app.pending_events.push_back((
                     window.pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
@@ -775,7 +782,10 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Axis { time, axis, value } => {
-                let window = app.focused.as_ref().unwrap();
+                // events queued before the focused window was destroyed
+                let Some(window) = app.focused.as_ref() else {
+                    return;
+                };
                 if app.scroll_discrete_pending {
                     // each axisvalue120 event is coupled with
                     // a corresponding axis event, which needs to
@@ -793,7 +803,10 @@ impl Dispatch<WlPointer, ()> for State {
                 }
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
-                let window = app.focused.as_ref().unwrap();
+                // events queued before the focused window was destroyed
+                let Some(window) = app.focused.as_ref() else {
+                    return;
+                };
                 app.scroll_discrete_pending = true;
                 app.pending_events.push_back((
                     window.pos,
@@ -902,19 +915,37 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
-            if let Some(window) = app
-                .active_windows
-                .iter()
-                .find(|w| &w.layer_surface == layer_surface)
-            {
-                // client corresponding to the layer_surface
-                let surface = &window.surface;
-                let buffer = &window.buffer;
-                surface.attach(Some(buffer), 0, 0);
-                layer_surface.ack_configure(serial);
-                surface.commit();
+        match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
+                if let Some(window) = app
+                    .active_windows
+                    .iter()
+                    .find(|w| &w.layer_surface == layer_surface)
+                {
+                    // client corresponding to the layer_surface
+                    let surface = &window.surface;
+                    let buffer = &window.buffer;
+                    surface.attach(Some(buffer), 0, 0);
+                    layer_surface.ack_configure(serial);
+                    surface.commit();
+                }
             }
+            zwlr_layer_surface_v1::Event::Closed => {
+                // The compositor stopped showing the surface, e.g. because its
+                // output was removed. A closed surface can keep exclusive
+                // keyboard focus, so release its grab and destroy it.
+                if app
+                    .focused
+                    .as_ref()
+                    .is_some_and(|w| &w.layer_surface == layer_surface)
+                {
+                    app.ungrab();
+                    app.focused = None;
+                }
+                app.active_windows
+                    .retain(|w| &w.layer_surface != layer_surface);
+            }
+            _ => {}
         }
     }
 }
