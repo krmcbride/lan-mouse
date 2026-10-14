@@ -24,8 +24,8 @@ use tokio::{sync::Notify, task::JoinHandle};
 
 use super::error::MacOSEmulationCreationError;
 
-const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
-const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
+const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(300);
+const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(25);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) struct MacOSEmulation {
