@@ -1,5 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    future::Future,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -11,10 +13,14 @@ use input_capture::{
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::{
+    process::Command,
+    task::{JoinHandle, spawn_local},
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::{config::KeyHook, connect::LanMouseConnection};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -68,6 +74,8 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// set captured key hooks
+    SetKeyHooks(Vec<KeyHook>),
 }
 
 impl Capture {
@@ -75,6 +83,7 @@ impl Capture {
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
+        key_hooks: Vec<KeyHook>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -86,6 +95,7 @@ impl Capture {
             captures: Default::default(),
             conn,
             event_tx,
+            key_hooks: KeyHookState::new(key_hooks),
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
@@ -144,6 +154,10 @@ impl Capture {
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
+
+    pub(crate) fn set_key_hooks(&mut self, hooks: Vec<KeyHook>) {
+        let _ = self.request_tx.send(CaptureRequest::SetKeyHooks(hooks));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -170,6 +184,7 @@ struct CaptureTask {
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
+    key_hooks: KeyHookState,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
@@ -221,6 +236,7 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::SetKeyHooks(hooks) => self.key_hooks.replace(hooks),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -248,12 +264,19 @@ impl CaptureTask {
             return Err(e.into());
         }
 
-        let r = self.do_capture_session(&mut capture).await;
+        let session_result = self.do_capture_session(&mut capture).await;
+
+        // Release remote and local held-key state even when the capture session
+        // ended because of an error or service cancellation.
+        let release_result = self.release_capture(&mut capture).await;
 
         // FIXME replace with async drop when stabilized
-        capture.terminate().await?;
+        let terminate_result = capture.terminate().await;
 
-        r
+        session_result?;
+        release_result?;
+        terminate_result?;
+        Ok(())
     }
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
@@ -324,6 +347,7 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::SetKeyHooks(hooks) => self.key_hooks.replace(hooks),
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -338,6 +362,21 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
+
+        // A destroyed barrier may still have events queued in the backend.
+        if !self.captures.iter().any(|(h, ..)| *h == handle) {
+            log::trace!("dropping event for destroyed capture {handle}");
+            return Ok(());
+        }
+
+        if !accepts_routed_event(self.active_client, handle, event) {
+            log::trace!("dropping input event for inactive capture {handle}");
+            return Ok(());
+        }
+
+        if let CaptureEvent::Input(event) = event {
+            capture.track_event(event);
+        }
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
@@ -373,16 +412,22 @@ impl CaptureTask {
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
-        let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+        let (event, hook_dispatch) = match event {
+            CaptureEvent::Begin => (ProtoEvent::Enter(opposite_pos), HookDispatch::default()),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
+                State::WaitingForAck => (
+                    ProtoEvent::Enter(opposite_pos),
+                    self.key_hooks.dispatch(e, false),
+                ),
+                State::Sending => (ProtoEvent::Input(e), self.key_hooks.dispatch(e, true)),
             },
         };
 
-        if let Err(e) = self.conn.send(event, handle).await {
+        let send_result =
+            send_with_hooks(hook_dispatch, self.conn.send(event, handle), run_key_hook).await;
+
+        if let Err(e) = send_result {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
             // Funnel through release_capture so the leave_hook
@@ -395,8 +440,17 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
-        // If we have an active client, notify them we're leaving
-        if let Some(handle) = self.active_client.take() {
+        let active_client = self.active_client.take();
+        self.state = State::WaitingForAck;
+        let pressed_keys = capture.take_pressed_keys();
+
+        // Stop capture before awaiting network or command IO so queued events
+        // cannot restart hooks or be forwarded after this terminal transition.
+        let release_result = capture.release().await;
+        let mut release_commands = Vec::new();
+
+        // If we have an active client, notify them we're leaving.
+        if let Some(handle) = active_client {
             // Surface the leave to the service layer so it can fire
             // the per-client leave_hook. Sent before the network
             // teardown below so we never race against the peer
@@ -414,7 +468,7 @@ impl CaptureTask {
             // then runs every subsequent keystroke through those held
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP/DTLS.
-            for key in capture.take_pressed_keys() {
+            for key in pressed_keys {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
                     key: key as u32,
@@ -422,6 +476,9 @@ impl CaptureTask {
                 }));
                 if let Err(e) = self.conn.send(key_up, handle).await {
                     log::warn!("failed to send key-up to client {handle}: {e}");
+                }
+                if let Some(command) = self.key_hooks.take_release(key) {
+                    release_commands.push(command);
                 }
             }
             // Reset the modifier mask too. The peer's input-emulation
@@ -444,7 +501,328 @@ impl CaptureTask {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
-        capture.release().await
+
+        release_commands.extend(self.key_hooks.drain_releases());
+        for command in release_commands {
+            run_key_hook("release", command).await;
+        }
+        release_result
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HookCommand {
+    command: String,
+    timeout: Duration,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HookDispatch {
+    before_forward: Option<HookCommand>,
+    after_forward: Option<HookCommand>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HookCommands {
+    press: Option<HookCommand>,
+    release: Option<HookCommand>,
+}
+
+impl From<KeyHook> for HookCommands {
+    fn from(hook: KeyHook) -> Self {
+        let timeout = Duration::from_millis(hook.timeout_ms);
+        Self {
+            press: hook.press.map(|command| HookCommand { command, timeout }),
+            release: hook.release.map(|command| HookCommand { command, timeout }),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct KeyHookState {
+    configured: HashMap<scancode::Linux, HookCommands>,
+    held: HashMap<scancode::Linux, Option<HookCommand>>,
+    pressed: HashSet<scancode::Linux>,
+}
+
+impl KeyHookState {
+    fn new(hooks: Vec<KeyHook>) -> Self {
+        let mut state = Self::default();
+        state.replace(hooks);
+        state
+    }
+
+    fn replace(&mut self, hooks: Vec<KeyHook>) {
+        self.configured = hooks
+            .into_iter()
+            .map(|hook| (hook.key, HookCommands::from(hook)))
+            .collect();
+    }
+
+    fn dispatch(&mut self, event: Event, allow_press: bool) -> HookDispatch {
+        let Event::Keyboard(KeyboardEvent::Key { key, state, .. }) = event else {
+            return HookDispatch::default();
+        };
+        let Ok(key) = scancode::Linux::try_from(key) else {
+            return HookDispatch::default();
+        };
+
+        match state {
+            1 if self.pressed.insert(key) && allow_press => {
+                let Some(hook) = self.configured.get(&key) else {
+                    return HookDispatch::default();
+                };
+                self.held.insert(key, hook.release.clone());
+                HookDispatch {
+                    before_forward: hook.press.clone(),
+                    after_forward: None,
+                }
+            }
+            0 => {
+                self.pressed.remove(&key);
+                HookDispatch {
+                    before_forward: None,
+                    after_forward: self.held.remove(&key).flatten(),
+                }
+            }
+            _ => HookDispatch::default(),
+        }
+    }
+
+    fn take_release(&mut self, key: scancode::Linux) -> Option<HookCommand> {
+        self.held.remove(&key).flatten()
+    }
+
+    fn drain_releases(&mut self) -> Vec<HookCommand> {
+        self.pressed.clear();
+        self.held
+            .drain()
+            .filter_map(|(_, command)| command)
+            .collect()
+    }
+}
+
+async fn run_key_hook(phase: &str, hook: HookCommand) {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(&hook.command).kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            log::warn!(
+                "could not spawn captured key {phase} hook {:?}: {e}",
+                hook.command
+            );
+            return;
+        }
+    };
+
+    match timeout(hook.timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => log::warn!(
+            "captured key {phase} hook {:?} exited with {status}",
+            hook.command
+        ),
+        Ok(Err(e)) => log::warn!(
+            "failed waiting for captured key {phase} hook {:?}: {e}",
+            hook.command
+        ),
+        Err(_) => {
+            log::warn!(
+                "captured key {phase} hook {:?} timed out after {:?}",
+                hook.command,
+                hook.timeout
+            );
+            if let Err(e) = child.kill().await {
+                log::warn!(
+                    "failed to kill timed-out captured key {phase} hook {:?}: {e}",
+                    hook.command
+                );
+            }
+        }
+    }
+}
+
+async fn send_with_hooks<E, SendFuture, RunHook, HookFuture>(
+    dispatch: HookDispatch,
+    send: SendFuture,
+    mut run_hook: RunHook,
+) -> Result<(), E>
+where
+    SendFuture: Future<Output = Result<(), E>>,
+    RunHook: FnMut(&'static str, HookCommand) -> HookFuture,
+    HookFuture: Future<Output = ()>,
+{
+    if let Some(command) = dispatch.before_forward {
+        run_hook("press", command).await;
+    }
+
+    let send_result = send.await;
+
+    if let Some(command) = dispatch.after_forward {
+        run_hook("release", command).await;
+    }
+
+    send_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HookCommand, HookDispatch, KeyHookState, accepts_routed_event, send_with_hooks};
+    use crate::config::KeyHook;
+    use input_capture::CaptureEvent;
+    use input_event::{Event, KeyboardEvent, scancode::Linux};
+    use std::{cell::RefCell, rc::Rc, time::Duration};
+
+    fn key_event(key: Linux, state: u8) -> Event {
+        Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: key as u32,
+            state,
+        })
+    }
+
+    fn right_alt_hook() -> KeyHook {
+        KeyHook {
+            key: Linux::KeyRightalt,
+            press: Some("duck-start".to_owned()),
+            release: Some("duck-stop".to_owned()),
+            timeout_ms: 250,
+        }
+    }
+
+    fn command(value: &str) -> Option<HookCommand> {
+        Some(HookCommand {
+            command: value.to_owned(),
+            timeout: Duration::from_millis(250),
+        })
+    }
+
+    #[test]
+    fn dispatches_press_before_forward_and_release_after_forward() {
+        let mut state = KeyHookState::new(vec![right_alt_hook()]);
+
+        assert_eq!(
+            state.dispatch(key_event(Linux::KeyRightalt, 1), true),
+            HookDispatch {
+                before_forward: command("duck-start"),
+                after_forward: None,
+            }
+        );
+        assert_eq!(
+            state.dispatch(key_event(Linux::KeyRightalt, 0), true),
+            HookDispatch {
+                before_forward: None,
+                after_forward: command("duck-stop"),
+            }
+        );
+    }
+
+    #[test]
+    fn suppresses_repeat_hooks_until_final_release() {
+        let mut state = KeyHookState::new(vec![right_alt_hook()]);
+
+        assert!(
+            state
+                .dispatch(key_event(Linux::KeyRightalt, 1), true)
+                .before_forward
+                .is_some()
+        );
+        assert_eq!(
+            state.dispatch(key_event(Linux::KeyRightalt, 1), true),
+            HookDispatch::default()
+        );
+        assert_eq!(
+            state.dispatch(key_event(Linux::KeyRightalt, 2), true),
+            HookDispatch::default()
+        );
+        assert_eq!(
+            state
+                .dispatch(key_event(Linux::KeyRightalt, 0), true)
+                .after_forward,
+            command("duck-stop")
+        );
+        assert_eq!(
+            state.dispatch(key_event(Linux::KeyRightalt, 0), true),
+            HookDispatch::default()
+        );
+    }
+
+    #[test]
+    fn drains_held_release_hook_exactly_once() {
+        let mut state = KeyHookState::new(vec![right_alt_hook()]);
+        state.dispatch(key_event(Linux::KeyRightalt, 1), true);
+
+        assert_eq!(state.drain_releases(), vec![command("duck-stop").unwrap()]);
+        assert!(state.drain_releases().is_empty());
+    }
+
+    #[test]
+    fn held_release_uses_configuration_from_press_time() {
+        let mut state = KeyHookState::new(vec![right_alt_hook()]);
+        state.dispatch(key_event(Linux::KeyRightalt, 1), true);
+        state.replace(Vec::new());
+
+        assert_eq!(
+            state
+                .dispatch(key_event(Linux::KeyRightalt, 0), true)
+                .after_forward,
+            command("duck-stop")
+        );
+    }
+
+    #[test]
+    fn does_not_press_hook_when_key_was_already_down_before_hooks_were_allowed() {
+        let mut state = KeyHookState::new(vec![right_alt_hook()]);
+
+        assert_eq!(
+            state.dispatch(key_event(Linux::KeyRightalt, 1), false),
+            HookDispatch::default()
+        );
+        assert_eq!(
+            state.dispatch(key_event(Linux::KeyRightalt, 1), true),
+            HookDispatch::default()
+        );
+        assert_eq!(
+            state.dispatch(key_event(Linux::KeyRightalt, 0), true),
+            HookDispatch::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn executes_press_then_send_then_release() {
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let send_actions = actions.clone();
+        let send = async move {
+            send_actions.borrow_mut().push("send");
+            Ok::<(), ()>(())
+        };
+        let hook_actions = actions.clone();
+
+        send_with_hooks(
+            HookDispatch {
+                before_forward: command("duck-start"),
+                after_forward: command("duck-stop"),
+            },
+            send,
+            move |phase, _| {
+                let hook_actions = hook_actions.clone();
+                async move { hook_actions.borrow_mut().push(phase) }
+            },
+        )
+        .await
+        .expect("send should succeed");
+
+        assert_eq!(&*actions.borrow(), &["press", "send", "release"]);
+    }
+
+    #[test]
+    fn rejects_queued_input_after_capture_release() {
+        let event = CaptureEvent::Input(key_event(Linux::KeyRightalt, 1));
+
+        assert!(!accepts_routed_event(None, 7, event));
+        assert!(!accepts_routed_event(Some(8), 7, event));
+        assert!(accepts_routed_event(Some(7), 7, event));
+        assert!(accepts_routed_event(None, 7, CaptureEvent::Begin));
     }
 }
 
@@ -475,6 +853,14 @@ fn to_proto_pos(pos: input_capture::Position) -> lan_mouse_proto::Position {
         input_capture::Position::Top => lan_mouse_proto::Position::Top,
         input_capture::Position::Bottom => lan_mouse_proto::Position::Bottom,
     }
+}
+
+fn accepts_routed_event(
+    active_client: Option<CaptureHandle>,
+    handle: CaptureHandle,
+    event: CaptureEvent,
+) -> bool {
+    !matches!(event, CaptureEvent::Input(_)) || active_client == Some(handle)
 }
 
 struct DropGuard<T> {

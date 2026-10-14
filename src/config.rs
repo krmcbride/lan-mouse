@@ -66,9 +66,23 @@ struct ConfigToml {
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
+    key_hooks: Option<Vec<KeyHook>>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+}
+
+const fn default_key_hook_timeout_ms() -> u64 {
+    1_000
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct KeyHook {
+    pub key: scancode::Linux,
+    pub press: Option<String>,
+    pub release: Option<String>,
+    #[serde(default = "default_key_hook_timeout_ms")]
+    pub timeout_ms: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -500,6 +514,14 @@ impl Config {
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
     }
 
+    /// commands triggered by captured key transitions
+    pub fn key_hooks(&self) -> Vec<KeyHook> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.key_hooks.clone())
+            .unwrap_or_default()
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
@@ -582,5 +604,48 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigToml, default_key_hook_timeout_ms};
+    use input_event::scancode::Linux;
+
+    #[test]
+    fn parses_key_hooks_with_default_and_explicit_timeouts() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+                port = 4242
+
+                [[key_hooks]]
+                key = "KeyRightalt"
+                press = "duck-start"
+                release = "duck-stop"
+
+                [[key_hooks]]
+                key = "KeyF13"
+                press = "notify"
+                timeout_ms = 250
+            "#,
+        )
+        .expect("key hook config should parse");
+
+        assert_eq!(config.port, Some(4242));
+        let hooks = config.key_hooks.expect("key hooks should be present");
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0].key, Linux::KeyRightalt);
+        assert_eq!(hooks[0].press.as_deref(), Some("duck-start"));
+        assert_eq!(hooks[0].release.as_deref(), Some("duck-stop"));
+        assert_eq!(hooks[0].timeout_ms, default_key_hook_timeout_ms());
+        assert_eq!(hooks[1].key, Linux::KeyF13);
+        assert_eq!(hooks[1].release, None);
+        assert_eq!(hooks[1].timeout_ms, 250);
+    }
+
+    #[test]
+    fn key_hooks_are_optional() {
+        let config: ConfigToml = toml::from_str("").expect("empty config should parse");
+        assert_eq!(config.key_hooks, None);
     }
 }

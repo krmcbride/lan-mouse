@@ -206,14 +206,22 @@ impl InputCapture {
         keys.iter().all(|k| self.pressed_keys.contains(k))
     }
 
-    fn update_pressed_keys(&mut self, key: u32, state: u8) {
-        if let Ok(scancode) = scancode::Linux::try_from(key) {
-            log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");
-            match state {
-                1 => self.pressed_keys.insert(scancode),
-                _ => self.pressed_keys.remove(&scancode),
-            };
+    /// update pressed-key state after the caller accepts a routed event
+    pub fn track_event(&mut self, event: Event) {
+        if let Event::Keyboard(KeyboardEvent::Key { key, state, .. }) = event {
+            update_pressed_key_set(&mut self.pressed_keys, key, state);
         }
+    }
+}
+
+fn update_pressed_key_set(pressed_keys: &mut HashSet<scancode::Linux>, key: u32, state: u8) {
+    if let Ok(scancode) = scancode::Linux::try_from(key) {
+        log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");
+        match state {
+            0 => pressed_keys.remove(&scancode),
+            1 => pressed_keys.insert(scancode),
+            _ => false,
+        };
     }
 }
 
@@ -242,11 +250,6 @@ impl Stream for InputCapture {
             Ok(e) => e,
             Err(e) => return Poll::Ready(Some(Err(e))),
         };
-
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
-        }
 
         let len = self
             .position_map
@@ -348,4 +351,25 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_pressed_key_set;
+    use input_event::scancode::Linux;
+    use std::collections::HashSet;
+
+    #[test]
+    fn autorepeat_preserves_pressed_key_until_release() {
+        let mut pressed_keys = HashSet::new();
+
+        update_pressed_key_set(&mut pressed_keys, Linux::KeyRightalt as u32, 1);
+        assert!(pressed_keys.contains(&Linux::KeyRightalt));
+
+        update_pressed_key_set(&mut pressed_keys, Linux::KeyRightalt as u32, 2);
+        assert!(pressed_keys.contains(&Linux::KeyRightalt));
+
+        update_pressed_key_set(&mut pressed_keys, Linux::KeyRightalt as u32, 0);
+        assert!(!pressed_keys.contains(&Linux::KeyRightalt));
+    }
 }

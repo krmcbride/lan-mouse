@@ -6,6 +6,15 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# Run local commands around captured key forwarding. The press command must
+# finish before key-down is forwarded; key-up is forwarded before release runs.
+# Hook failures and timeouts do not prevent forwarding.
+[[key_hooks]]
+key = "KeyF13"
+press = "notify-send 'captured key pressed'"
+release = "notify-send 'captured key released'"
+timeout_ms = 1000
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]

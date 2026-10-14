@@ -395,6 +395,14 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# run local commands around captured key forwarding
+[[key_hooks]]
+key = "KeyF13"
+press = "notify-send 'captured key pressed'"
+release = "notify-send 'captured key released'"
+# optional command timeout in milliseconds (defaults to 1000)
+timeout_ms = 1000
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]
@@ -424,6 +432,16 @@ port = 4242
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
+
+Captured key hooks run only while this device is sending captured input to a
+remote client. A hook's `press` command completes before the first key-down is
+forwarded; key-up is forwarded before its `release` command runs. Repeated
+key-down events do not rerun the press command. Command failures and timeouts
+are logged without preventing input forwarding, and held release hooks run when
+capture ends. The `press` and `release` fields are independently optional.
+Hook commands should remain foreground processes; timeout cleanup only manages
+the shell process directly and cannot guarantee termination of background
+descendants.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

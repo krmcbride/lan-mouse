@@ -141,6 +141,7 @@ impl LanMouseConnection {
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
                         disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        return Err(e.into());
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
