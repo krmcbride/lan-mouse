@@ -67,6 +67,7 @@ struct ConfigToml {
     port: Option<u16>,
     release_bind: Option<Vec<scancode::Linux>>,
     key_hooks: Option<Vec<KeyHook>>,
+    grab_key_map: Option<HashMap<scancode::Linux, scancode::Linux>>,
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
@@ -528,6 +529,14 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// keys replaced in input from grabbed devices
+    pub fn grab_key_map(&self) -> HashMap<scancode::Linux, scancode::Linux> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.grab_key_map.clone())
+            .unwrap_or_default()
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
@@ -647,6 +656,19 @@ mod tests {
         assert_eq!(hooks[1].key, Linux::KeyF13);
         assert_eq!(hooks[1].release, None);
         assert_eq!(hooks[1].timeout_ms, 250);
+    }
+
+    #[test]
+    fn grab_key_map_round_trips() {
+        let config: ConfigToml =
+            toml::from_str(r#"grab_key_map = { KeyCapsLock = "KeyLeftCtrl" }"#)
+                .expect("grab key map should parse");
+        let map = config.grab_key_map.clone().expect("grab key map");
+        assert_eq!(map.get(&Linux::KeyCapsLock), Some(&Linux::KeyLeftCtrl));
+
+        let written = toml_edit::ser::to_string_pretty(&config).expect("serialize");
+        let reread: ConfigToml = toml::from_str(&written).expect("reparse");
+        assert_eq!(reread.grab_key_map, config.grab_key_map);
     }
 
     #[test]

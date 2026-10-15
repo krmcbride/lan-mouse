@@ -395,6 +395,10 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# replace keys in input from devices grabbed in stand-in mode, which bypasses
+# the compositor's key remapping (here XKB's ctrl:nocaps)
+grab_key_map = { KeyCapsLock = "KeyLeftCtrl" }
+
 # run local commands around captured key forwarding
 [[key_hooks]]
 key = "KeyF13"
@@ -470,7 +474,9 @@ so input does not depend on screen edges or on the local display still being
 connected. The grab waits up to two seconds each for the stand-in client to
 connect and for held keys to be released. It ends whenever the capture is
 released, including through the release bind; `lan-mouse cli stand-in on` grabs
-again. Opening input devices requires read
+again. Grabbed input bypasses the compositor's keyboard settings, such as XKB
+options; `grab_key_map` replaces keys to make up for them. Opening input devices
+requires read
 access to `/dev/input/event*`. Prefer a udev rule that grants it only for the
 devices to grab, such as
 `SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="1234", ATTRS{idProduct}=="abcd", TAG+="uaccess"`

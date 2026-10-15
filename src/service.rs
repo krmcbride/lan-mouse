@@ -105,6 +105,7 @@ impl Service {
             conn,
             config.release_bind(),
             config.key_hooks(),
+            config.grab_key_map(),
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener);
@@ -280,6 +281,8 @@ impl Service {
         self.capture.set_release_bind(release_bind);
         let key_hooks = self.config.key_hooks();
         self.capture.set_key_hooks(key_hooks);
+        let grab_key_map = self.config.grab_key_map();
+        self.capture.set_grab_key_map(grab_key_map);
         self.sync_stand_in();
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys

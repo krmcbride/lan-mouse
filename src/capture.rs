@@ -77,6 +77,8 @@ enum CaptureRequest {
     SetReleaseBind(Vec<scancode::Linux>),
     /// set captured key hooks
     SetKeyHooks(Vec<KeyHook>),
+    /// set keys replaced in input from grabbed devices
+    SetGrabKeyMap(HashMap<scancode::Linux, scancode::Linux>),
     /// set (or clear) the client standing in for the local screen
     SetStandIn(Option<StandIn>),
     /// grab the local input devices and forward them to the stand-in
@@ -109,6 +111,7 @@ impl Capture {
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
         key_hooks: Vec<KeyHook>,
+        grab_key_map: HashMap<scancode::Linux, scancode::Linux>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -122,6 +125,7 @@ impl Capture {
             conn,
             device_grab: None,
             event_tx,
+            grab_key_map,
             key_hooks: KeyHookState::new(key_hooks),
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
@@ -187,6 +191,10 @@ impl Capture {
         let _ = self.request_tx.send(CaptureRequest::SetKeyHooks(hooks));
     }
 
+    pub(crate) fn set_grab_key_map(&mut self, map: HashMap<scancode::Linux, scancode::Linux>) {
+        let _ = self.request_tx.send(CaptureRequest::SetGrabKeyMap(map));
+    }
+
     pub(crate) fn set_stand_in(&self, stand_in: Option<(CaptureHandle, lan_mouse_ipc::Position)>) {
         let stand_in = stand_in.map(|(handle, pos)| StandIn {
             handle,
@@ -231,6 +239,9 @@ struct CaptureTask {
     /// screen; takes the place of a barrier's grab
     device_grab: Option<DeviceGrab>,
     event_tx: Sender<ICaptureEvent>,
+    /// keys replaced in input from grabbed devices, which bypasses the
+    /// compositor's key remapping
+    grab_key_map: HashMap<scancode::Linux, scancode::Linux>,
     key_hooks: KeyHookState,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
@@ -295,6 +306,7 @@ impl CaptureTask {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
                         CaptureRequest::SetKeyHooks(hooks) => self.key_hooks.replace(hooks),
+                        CaptureRequest::SetGrabKeyMap(map) => self.grab_key_map = map,
                         CaptureRequest::SetStandIn(stand_in) => self.stand_in = stand_in,
                         CaptureRequest::EnterStandIn => {
                             log::warn!("cannot enter the stand-in: input capture is disabled");
@@ -429,6 +441,7 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                     CaptureRequest::SetKeyHooks(hooks) => self.key_hooks.replace(hooks),
+                    CaptureRequest::SetGrabKeyMap(map) => self.grab_key_map = map,
                     CaptureRequest::SetStandIn(stand_in) => self.set_stand_in(capture, stand_in).await?,
                     CaptureRequest::EnterStandIn => self.enter_stand_in(capture).await?,
                 },
@@ -513,6 +526,7 @@ impl CaptureTask {
         event: Event,
     ) -> Result<(), CaptureError> {
         log::trace!("(grab): {event:?}");
+        let event = remap_key(&self.grab_key_map, event);
         capture.track_event(event);
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
@@ -930,12 +944,12 @@ where
 mod tests {
     use super::{
         CaptureType, HookCommand, HookDispatch, KeyHookState, LeaveAction, StandIn,
-        accepts_routed_event, leave_action, send_failure_fallback, send_with_hooks,
+        accepts_routed_event, leave_action, remap_key, send_failure_fallback, send_with_hooks,
     };
     use crate::config::KeyHook;
     use input_capture::{CaptureEvent, Position};
     use input_event::{Event, KeyboardEvent, scancode::Linux};
-    use std::{cell::RefCell, rc::Rc, time::Duration};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
 
     fn key_event(key: Linux, state: u8) -> Event {
         Event::Keyboard(KeyboardEvent::Key {
@@ -1138,6 +1152,19 @@ mod tests {
     }
 
     #[test]
+    fn remaps_only_mapped_keys() {
+        let map = HashMap::from([(Linux::KeyCapsLock, Linux::KeyLeftCtrl)]);
+        assert_eq!(
+            remap_key(&map, key_event(Linux::KeyCapsLock, 1)),
+            key_event(Linux::KeyLeftCtrl, 1)
+        );
+        assert_eq!(
+            remap_key(&map, key_event(Linux::KeyA, 1)),
+            key_event(Linux::KeyA, 1)
+        );
+    }
+
+    #[test]
     fn failed_send_falls_back_to_stand_in_only_from_other_clients() {
         assert_eq!(send_failure_fallback(None, LEFT_NEIGHBOR), None);
         assert_eq!(
@@ -1145,6 +1172,20 @@ mod tests {
             Some(STAND_IN)
         );
         assert_eq!(send_failure_fallback(Some(STAND_IN_RIGHT), STAND_IN), None);
+    }
+}
+
+/// Replaces the key of a key event according to `map`.
+fn remap_key(map: &HashMap<scancode::Linux, scancode::Linux>, event: Event) -> Event {
+    match event {
+        Event::Keyboard(KeyboardEvent::Key { time, key, state }) => {
+            let key = scancode::Linux::try_from(key)
+                .ok()
+                .and_then(|k| map.get(&k))
+                .map_or(key, |&mapped| mapped as u32);
+            Event::Keyboard(KeyboardEvent::Key { time, key, state })
+        }
+        event => event,
     }
 }
 

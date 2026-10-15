@@ -6,6 +6,10 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# replace keys in input from devices grabbed in stand-in mode, which bypasses
+# the compositor's key remapping (here XKB's ctrl:nocaps)
+grab_key_map = { KeyCapsLock = "KeyLeftCtrl" }
+
 # Run local commands around captured key forwarding. The press command must
 # finish before key-down is forwarded; key-up is forwarded before release runs.
 # Hook failures and timeouts do not prevent forwarding.
