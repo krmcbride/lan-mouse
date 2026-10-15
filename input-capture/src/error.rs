@@ -31,6 +31,10 @@ pub enum CaptureError {
     EndOfStream,
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
+    #[error("no keyboard or pointer device could be opened and grabbed")]
+    NoGrabbableDevices,
+    #[error("grabbing input devices is not supported on this platform")]
+    DeviceGrabUnsupported,
     #[cfg(libei)]
     #[error("libei error: `{0}`")]
     Reis(#[from] reis::Error),

@@ -464,6 +464,20 @@ another client fails, input returns to the stand-in client; only a failure to
 reach the stand-in client itself releases the capture. Turning the mode off
 while the stand-in client receives input releases the capture.
 
+On Linux, enabling stand-in mode also grabs every physical keyboard and pointer
+that Lan Mouse can open (through evdev) and enters the stand-in client directly,
+so input does not depend on screen edges or on the local display still being
+connected. The grab waits up to two seconds each for the stand-in client to
+connect and for held keys to be released. It ends whenever the capture is
+released, including through the release bind; `lan-mouse cli stand-in on` grabs
+again. Opening input devices requires read
+access to `/dev/input/event*`. Prefer a udev rule that grants it only for the
+devices to grab, such as
+`SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="1234", ATTRS{idProduct}=="abcd", TAG+="uaccess"`
+in a rules file ordered before `73-seat-late.rules`, over membership in the
+`input` group, which can read every input device. Without device access, the
+stand-in client is reachable only across screen edges.
+
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
 - [x] respect xdg-config-home for config file location.

@@ -1,14 +1,15 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    future::Future,
+    future::{Future, pending},
     rc::Rc,
     time::{Duration, Instant},
 };
 
 use futures::StreamExt;
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    CaptureError, CaptureEvent, CaptureHandle, DeviceGrab, InputCapture, InputCaptureError,
+    Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
@@ -78,6 +79,8 @@ enum CaptureRequest {
     SetKeyHooks(Vec<KeyHook>),
     /// set (or clear) the client standing in for the local screen
     SetStandIn(Option<StandIn>),
+    /// grab the local input devices and forward them to the stand-in
+    EnterStandIn,
 }
 
 /// A client that takes the local screen's place: while set, a `Leave`
@@ -117,6 +120,7 @@ impl Capture {
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
             conn,
+            device_grab: None,
             event_tx,
             key_hooks: KeyHookState::new(key_hooks),
             request_rx,
@@ -190,6 +194,10 @@ impl Capture {
         });
         let _ = self.request_tx.send(CaptureRequest::SetStandIn(stand_in));
     }
+
+    pub(crate) fn enter_stand_in(&self) {
+        let _ = self.request_tx.send(CaptureRequest::EnterStandIn);
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -219,6 +227,9 @@ struct CaptureTask {
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: LanMouseConnection,
+    /// keyboards and pointers grabbed while a stand-in replaces the local
+    /// screen; takes the place of a barrier's grab
+    device_grab: Option<DeviceGrab>,
     event_tx: Sender<ICaptureEvent>,
     key_hooks: KeyHookState,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
@@ -285,6 +296,9 @@ impl CaptureTask {
                         }
                         CaptureRequest::SetKeyHooks(hooks) => self.key_hooks.replace(hooks),
                         CaptureRequest::SetStandIn(stand_in) => self.stand_in = stand_in,
+                        CaptureRequest::EnterStandIn => {
+                            log::warn!("cannot enter the stand-in: input capture is disabled");
+                        }
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -348,6 +362,13 @@ impl CaptureTask {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
                 },
+                event = next_grabbed(&mut self.device_grab) => match event {
+                    Some(event) => self.handle_grabbed_event(capture, event).await?,
+                    None => {
+                        log::warn!("releasing capture: grabbed input devices are gone");
+                        self.release_capture(capture).await?;
+                    }
+                },
                 (handle, event) = self.conn.recv() => {
                     if let Some(active) = self.active_client {
                         if handle != active {
@@ -409,6 +430,7 @@ impl CaptureTask {
                     }
                     CaptureRequest::SetKeyHooks(hooks) => self.key_hooks.replace(hooks),
                     CaptureRequest::SetStandIn(stand_in) => self.set_stand_in(capture, stand_in).await?,
+                    CaptureRequest::EnterStandIn => self.enter_stand_in(capture).await?,
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -427,6 +449,13 @@ impl CaptureTask {
         // A destroyed barrier may still have events queued in the backend.
         if !self.captures.iter().any(|(h, ..)| *h == handle) {
             log::trace!("dropping event for destroyed capture {handle}");
+            return Ok(());
+        }
+
+        // Input reaches barriers only through the compositor, which a
+        // device grab cuts off; anything still queued is stale.
+        if self.device_grab.is_some() {
+            log::trace!("dropping event for capture {handle} during device grab");
             return Ok(());
         }
 
@@ -475,6 +504,35 @@ impl CaptureTask {
         // after a stand-in handoff, input grabbed by one barrier is
         // forwarded to a different client
         let target = self.active_client.unwrap_or(handle);
+        self.forward(capture, target, event).await
+    }
+
+    async fn handle_grabbed_event(
+        &mut self,
+        capture: &mut InputCapture,
+        event: Event,
+    ) -> Result<(), CaptureError> {
+        log::trace!("(grab): {event:?}");
+        capture.track_event(event);
+        if capture.keys_pressed(&self.release_bind.borrow()) {
+            log::info!("releasing capture: release-bind pressed");
+            return self.release_capture(capture).await;
+        }
+        match self.active_client {
+            Some(target) => {
+                self.forward(capture, target, CaptureEvent::Input(event))
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn forward(
+        &mut self,
+        capture: &mut InputCapture,
+        target: CaptureHandle,
+        event: CaptureEvent,
+    ) -> Result<(), CaptureError> {
         let Some(target_pos) = self.client_pos(target) else {
             log::warn!("releasing capture: client {target} has no position");
             return self.release_capture(capture).await;
@@ -518,6 +576,8 @@ impl CaptureTask {
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let active_client = self.active_client.take();
         self.grab = None;
+        // dropping the grab returns the devices to the compositor
+        self.device_grab = None;
         self.state = State::WaitingForAck;
         let pressed_keys = capture.take_pressed_keys();
 
@@ -613,20 +673,23 @@ impl CaptureTask {
         log::info!("handing off from client {from} to client {to}");
         let pressed_keys = capture.take_pressed_keys();
         let release_commands = self.leave_client(from, pressed_keys).await;
+        self.enter_client(to, pos).await;
+        for command in release_commands {
+            run_key_hook("release", command).await;
+        }
+    }
 
-        self.active_client = Some(to);
+    /// Starts forwarding to `handle`, which borders this device at `pos`.
+    async fn enter_client(&mut self, handle: CaptureHandle, pos: Position) {
+        self.active_client = Some(handle);
         self.state = State::WaitingForAck;
         self.event_tx
-            .send(ICaptureEvent::ClientEntered(to))
+            .send(ICaptureEvent::ClientEntered(handle))
             .expect("channel closed");
         // Further input repeats `Enter` until the peer acknowledges it.
         let enter = ProtoEvent::Enter(to_proto_pos(pos.opposite()));
-        if let Err(e) = self.conn.send(enter, to).await {
-            log::debug!("failed to send Enter to client {to}: {e}");
-        }
-
-        for command in release_commands {
-            run_key_hook("release", command).await;
+        if let Err(e) = self.conn.send(enter, handle).await {
+            log::debug!("failed to send Enter to client {handle}: {e}");
         }
     }
 
@@ -638,7 +701,8 @@ impl CaptureTask {
         let previous = std::mem::replace(&mut self.stand_in, stand_in);
         if let Some(previous) = previous {
             let still_stand_in = stand_in.is_some_and(|s| s.handle == previous.handle);
-            if self.active_client == Some(previous.handle) && !still_stand_in {
+            let forwarding = self.active_client == Some(previous.handle);
+            if !still_stand_in && (forwarding || self.device_grab.is_some()) {
                 log::info!(
                     "releasing capture: client {} no longer stands in",
                     previous.handle
@@ -652,6 +716,58 @@ impl CaptureTask {
             let _ = self.conn.send(ProtoEvent::Ping, stand_in.handle).await;
         }
         Ok(())
+    }
+
+    /// Takes the local keyboards and pointers from the compositor and enters
+    /// the stand-in, so input reaches it without crossing an edge and keeps
+    /// flowing while the local display is gone.
+    async fn enter_stand_in(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        let Some(stand_in) = self.stand_in else {
+            log::warn!("cannot enter the stand-in: stand-in mode is off");
+            return Ok(());
+        };
+        if self.device_grab.is_some() {
+            return Ok(());
+        }
+        // A failed send to the stand-in releases the capture, so grab only
+        // once the stand-in is connected.
+        if !self.wait_for_connection(stand_in.handle).await {
+            log::warn!(
+                "cannot enter the stand-in: client {} is unreachable",
+                stand_in.handle
+            );
+            return Ok(());
+        }
+        let device_grab = match DeviceGrab::new().await {
+            Ok(device_grab) => device_grab,
+            Err(e) => {
+                log::warn!("stand-in is reachable only across edges: {e}");
+                return Ok(());
+            }
+        };
+        match self.active_client {
+            Some(active) if active == stand_in.handle => {}
+            Some(active) => self.hand_off(capture, active, stand_in.handle).await,
+            None => self.enter_client(stand_in.handle, stand_in.pos).await,
+        }
+        // the device grab replaces a barrier's grab
+        self.grab = None;
+        capture.release().await?;
+        self.device_grab = Some(device_grab);
+        Ok(())
+    }
+
+    async fn wait_for_connection(&self, handle: CaptureHandle) -> bool {
+        const ATTEMPTS: u32 = 20;
+        for attempt in 1..=ATTEMPTS {
+            if self.conn.send(ProtoEvent::Ping, handle).await.is_ok() {
+                return true;
+            }
+            if attempt < ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        false
     }
 }
 
@@ -1029,6 +1145,13 @@ mod tests {
             Some(STAND_IN)
         );
         assert_eq!(send_failure_fallback(Some(STAND_IN_RIGHT), STAND_IN), None);
+    }
+}
+
+async fn next_grabbed(device_grab: &mut Option<DeviceGrab>) -> Option<Event> {
+    match device_grab {
+        Some(device_grab) => device_grab.next().await,
+        None => pending().await,
     }
 }
 

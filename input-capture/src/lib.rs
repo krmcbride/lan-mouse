@@ -33,6 +33,14 @@ mod x11;
 /// fallback input capture (does not produce events)
 mod dummy;
 
+#[cfg(evdev)]
+mod device_grab;
+#[cfg(not(evdev))]
+#[path = "device_grab_unsupported.rs"]
+mod device_grab;
+
+pub use device_grab::DeviceGrab;
+
 pub type CaptureHandle = u64;
 
 #[derive(Copy, Clone, Debug, PartialEq)]

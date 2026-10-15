@@ -230,6 +230,11 @@ impl Service {
             FrontendRequest::SetStandIn(enabled) => {
                 self.stand_in_enabled = enabled;
                 self.sync_stand_in();
+                // Resyncs after config changes keep the current grab state;
+                // only an explicit request enters the stand-in.
+                if enabled {
+                    self.capture.enter_stand_in();
+                }
             }
         }
     }

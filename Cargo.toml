@@ -78,6 +78,7 @@ default = [
     "layer_shell_capture",
     "x11_capture",
     "libei_capture",
+    "evdev_capture",
     "wlroots_emulation",
     "libei_emulation",
     "rdp_emulation",
@@ -87,6 +88,7 @@ gtk = ["dep:lan-mouse-gtk"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
+evdev_capture = ["input-capture/evdev"]
 libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]
 x11_emulation = ["input-emulation/x11"]
