@@ -76,6 +76,28 @@ enum CaptureRequest {
     SetReleaseBind(Vec<scancode::Linux>),
     /// set captured key hooks
     SetKeyHooks(Vec<KeyHook>),
+    /// set (or clear) the client standing in for the local screen
+    SetStandIn(Option<StandIn>),
+}
+
+/// A client that takes the local screen's place: while set, a `Leave`
+/// from a remote client hands input to the next remote client instead of
+/// returning it to the local screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StandIn {
+    handle: CaptureHandle,
+    pos: Position,
+}
+
+/// What to do when the client we are forwarding to reports a `Leave`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaveAction {
+    /// return input to the local screen
+    Release,
+    /// keep forwarding to the same client
+    Stay,
+    /// forward to another client without releasing the local grab
+    HandOff(CaptureHandle),
 }
 
 impl Capture {
@@ -90,6 +112,7 @@ impl Capture {
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
+            grab: None,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -98,6 +121,7 @@ impl Capture {
             key_hooks: KeyHookState::new(key_hooks),
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
+            stand_in: None,
             state: Default::default(),
         };
         let task = spawn_local(capture_task.run());
@@ -158,6 +182,14 @@ impl Capture {
     pub(crate) fn set_key_hooks(&mut self, hooks: Vec<KeyHook>) {
         let _ = self.request_tx.send(CaptureRequest::SetKeyHooks(hooks));
     }
+
+    pub(crate) fn set_stand_in(&self, stand_in: Option<(CaptureHandle, lan_mouse_ipc::Position)>) {
+        let stand_in = stand_in.map(|(handle, pos)| StandIn {
+            handle,
+            pos: to_capture_pos(pos),
+        });
+        let _ = self.request_tx.send(CaptureRequest::SetStandIn(stand_in));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -178,7 +210,11 @@ macro_rules! debounce {
 }
 
 struct CaptureTask {
+    /// the client input is currently forwarded to
     active_client: Option<CaptureHandle>,
+    /// the capture whose barrier holds the local grab; differs from
+    /// `active_client` after a stand-in handoff
+    grab: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -187,6 +223,7 @@ struct CaptureTask {
     key_hooks: KeyHookState,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
+    stand_in: Option<StandIn>,
     state: State,
 }
 
@@ -213,6 +250,16 @@ impl CaptureTask {
             .1
     }
 
+    /// position of a forwarding target, which may be the stand-in client
+    /// rather than a capture barrier
+    fn client_pos(&self, handle: CaptureHandle) -> Option<Position> {
+        self.captures
+            .iter()
+            .find(|&&(h, _, t)| h == handle && t == CaptureType::Default)
+            .map(|&(_, p, _)| p)
+            .or(self.stand_in.filter(|s| s.handle == handle).map(|s| s.pos))
+    }
+
     fn get_type(&self, handle: CaptureHandle) -> CaptureType {
         self.captures
             .iter()
@@ -237,6 +284,7 @@ impl CaptureTask {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
                         CaptureRequest::SetKeyHooks(hooks) => self.key_hooks.replace(hooks),
+                        CaptureRequest::SetStandIn(stand_in) => self.stand_in = stand_in,
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -317,8 +365,18 @@ impl CaptureTask {
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
-                            log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture).await?;
+                            match leave_action(self.stand_in, &self.captures, handle) {
+                                LeaveAction::Release => {
+                                    log::info!("releasing capture: left remote client device region");
+                                    self.release_capture(capture).await?;
+                                }
+                                LeaveAction::Stay => {
+                                    log::debug!("stand-in client {handle} left, but has no neighbor");
+                                }
+                                LeaveAction::HandOff(next) => {
+                                    self.hand_off(capture, handle, next).await;
+                                }
+                            }
                         },
                         _ => {}
                     }
@@ -338,7 +396,9 @@ impl CaptureTask {
                         // pressed-key state to the peer; without this,
                         // `cli deactivate` (or a hostname change
                         // re-creating the client) would skip leave_hook.
-                        if self.active_client == Some(h) {
+                        // The same applies to the barrier holding the
+                        // grab after a stand-in handoff.
+                        if self.active_client == Some(h) || self.grab == Some(h) {
                             self.release_capture(capture).await?;
                         }
                         self.remove_capture(h);
@@ -348,6 +408,7 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                     CaptureRequest::SetKeyHooks(hooks) => self.key_hooks.replace(hooks),
+                    CaptureRequest::SetStandIn(stand_in) => self.set_stand_in(capture, stand_in).await?,
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -369,7 +430,7 @@ impl CaptureTask {
             return Ok(());
         }
 
-        if !accepts_routed_event(self.active_client, handle, event) {
+        if !accepts_routed_event(self.grab, handle, event) {
             log::trace!("dropping input event for inactive capture {handle}");
             return Ok(());
         }
@@ -402,15 +463,23 @@ impl CaptureTask {
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+        if event == CaptureEvent::Begin && Some(handle) != self.grab {
             self.state = State::WaitingForAck;
+            self.grab.replace(handle);
             self.active_client.replace(handle);
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        // after a stand-in handoff, input grabbed by one barrier is
+        // forwarded to a different client
+        let target = self.active_client.unwrap_or(handle);
+        let Some(target_pos) = self.client_pos(target) else {
+            log::warn!("releasing capture: client {target} has no position");
+            return self.release_capture(capture).await;
+        };
+        let opposite_pos = to_proto_pos(target_pos.opposite());
 
         let (event, hook_dispatch) = match event {
             CaptureEvent::Begin => (ProtoEvent::Enter(opposite_pos), HookDispatch::default()),
@@ -425,7 +494,7 @@ impl CaptureTask {
         };
 
         let send_result =
-            send_with_hooks(hook_dispatch, self.conn.send(event, handle), run_key_hook).await;
+            send_with_hooks(hook_dispatch, self.conn.send(event, target), run_key_hook).await;
 
         if let Err(e) = send_result {
             const DUR: Duration = Duration::from_millis(500);
@@ -441,6 +510,7 @@ impl CaptureTask {
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let active_client = self.active_client.take();
+        self.grab = None;
         self.state = State::WaitingForAck;
         let pressed_keys = capture.take_pressed_keys();
 
@@ -451,55 +521,7 @@ impl CaptureTask {
 
         // If we have an active client, notify them we're leaving.
         if let Some(handle) = active_client {
-            // Surface the leave to the service layer so it can fire
-            // the per-client leave_hook. Sent before the network
-            // teardown below so we never race against the peer
-            // disappearing.
-            self.event_tx
-                .send(ICaptureEvent::ClientLeft(handle))
-                .expect("channel closed");
-            // Synthesize key-up events for every key still held in the
-            // capture's pressed_keys set BEFORE sending Leave. Without
-            // this, pressing the release-bind chord (typically all four
-            // modifiers) leaves the peer with phantom held modifiers:
-            // the down events were forwarded while capture was active,
-            // but the matching up events arrive after the local tap
-            // flips to passthrough and never reach the peer. The peer
-            // then runs every subsequent keystroke through those held
-            // mods until its watchdog times out (1+ s) or our Leave
-            // arrives — and Leave can be lost over UDP/DTLS.
-            for key in pressed_keys {
-                let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key: key as u32,
-                    state: 0,
-                }));
-                if let Err(e) = self.conn.send(key_up, handle).await {
-                    log::warn!("failed to send key-up to client {handle}: {e}");
-                }
-                if let Some(command) = self.key_hooks.take_release(key) {
-                    release_commands.push(command);
-                }
-            }
-            // Reset the modifier mask too. The peer's input-emulation
-            // layer keeps a separate XKB-style modifier state that's
-            // updated by KeyboardEvent::Modifiers, distinct from the
-            // pressed_keys set drained above. Without this, an
-            // already-locked CapsLock would survive the release.
-            let mods_zero = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
-                depressed: 0,
-                latched: 0,
-                locked: 0,
-                group: 0,
-            }));
-            if let Err(e) = self.conn.send(mods_zero, handle).await {
-                log::warn!("failed to reset modifiers on client {handle}: {e}");
-            }
-
-            log::info!("sending Leave event to client {handle}");
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
-                log::warn!("failed to send Leave to client {handle}: {e}");
-            }
+            release_commands = self.leave_client(handle, pressed_keys).await;
         }
 
         release_commands.extend(self.key_hooks.drain_releases());
@@ -507,6 +529,122 @@ impl CaptureTask {
             run_key_hook("release", command).await;
         }
         release_result
+    }
+
+    /// Stops forwarding to `handle`: flushes held keys and modifiers to the
+    /// peer and sends `Leave`. Returns release hooks of the flushed keys.
+    async fn leave_client(
+        &mut self,
+        handle: CaptureHandle,
+        pressed_keys: HashSet<scancode::Linux>,
+    ) -> Vec<HookCommand> {
+        let mut release_commands = Vec::new();
+        // Surface the leave to the service layer so it can fire
+        // the per-client leave_hook. Sent before the network
+        // teardown below so we never race against the peer
+        // disappearing.
+        self.event_tx
+            .send(ICaptureEvent::ClientLeft(handle))
+            .expect("channel closed");
+        // Synthesize key-up events for every key still held in the
+        // capture's pressed_keys set BEFORE sending Leave. Without
+        // this, pressing the release-bind chord (typically all four
+        // modifiers) leaves the peer with phantom held modifiers:
+        // the down events were forwarded while capture was active,
+        // but the matching up events arrive after the local tap
+        // flips to passthrough and never reach the peer. The peer
+        // then runs every subsequent keystroke through those held
+        // mods until its watchdog times out (1+ s) or our Leave
+        // arrives — and Leave can be lost over UDP/DTLS.
+        for key in pressed_keys {
+            let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: key as u32,
+                state: 0,
+            }));
+            if let Err(e) = self.conn.send(key_up, handle).await {
+                log::warn!("failed to send key-up to client {handle}: {e}");
+            }
+            if let Some(command) = self.key_hooks.take_release(key) {
+                release_commands.push(command);
+            }
+        }
+        // Reset the modifier mask too. The peer's input-emulation
+        // layer keeps a separate XKB-style modifier state that's
+        // updated by KeyboardEvent::Modifiers, distinct from the
+        // pressed_keys set drained above. Without this, an
+        // already-locked CapsLock would survive the release.
+        let mods_zero = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: 0,
+            latched: 0,
+            locked: 0,
+            group: 0,
+        }));
+        if let Err(e) = self.conn.send(mods_zero, handle).await {
+            log::warn!("failed to reset modifiers on client {handle}: {e}");
+        }
+
+        log::info!("sending Leave event to client {handle}");
+        if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
+            log::warn!("failed to send Leave to client {handle}: {e}");
+        }
+        release_commands
+    }
+
+    /// Moves forwarding from `from` to `to` while keeping the local grab,
+    /// so input never returns to the (replaced) local screen.
+    async fn hand_off(
+        &mut self,
+        capture: &mut InputCapture,
+        from: CaptureHandle,
+        to: CaptureHandle,
+    ) {
+        let Some(pos) = self.client_pos(to) else {
+            log::warn!("cannot hand off to client {to}: no position");
+            return;
+        };
+        log::info!("handing off from client {from} to client {to}");
+        let pressed_keys = capture.take_pressed_keys();
+        let release_commands = self.leave_client(from, pressed_keys).await;
+
+        self.active_client = Some(to);
+        self.state = State::WaitingForAck;
+        self.event_tx
+            .send(ICaptureEvent::ClientEntered(to))
+            .expect("channel closed");
+        // Further input repeats `Enter` until the peer acknowledges it.
+        let enter = ProtoEvent::Enter(to_proto_pos(pos.opposite()));
+        if let Err(e) = self.conn.send(enter, to).await {
+            log::debug!("failed to send Enter to client {to}: {e}");
+        }
+
+        for command in release_commands {
+            run_key_hook("release", command).await;
+        }
+    }
+
+    async fn set_stand_in(
+        &mut self,
+        capture: &mut InputCapture,
+        stand_in: Option<StandIn>,
+    ) -> Result<(), CaptureError> {
+        let previous = std::mem::replace(&mut self.stand_in, stand_in);
+        if let Some(previous) = previous {
+            let still_stand_in = stand_in.is_some_and(|s| s.handle == previous.handle);
+            if self.active_client == Some(previous.handle) && !still_stand_in {
+                log::info!(
+                    "releasing capture: client {} no longer stands in",
+                    previous.handle
+                );
+                self.release_capture(capture).await?;
+            }
+        }
+        if let Some(stand_in) = stand_in {
+            // Connect ahead of the first handoff: a send that fails because
+            // the connection is still being set up releases the capture.
+            let _ = self.conn.send(ProtoEvent::Ping, stand_in.handle).await;
+        }
+        Ok(())
     }
 }
 
@@ -667,9 +805,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{HookCommand, HookDispatch, KeyHookState, accepts_routed_event, send_with_hooks};
+    use super::{
+        CaptureType, HookCommand, HookDispatch, KeyHookState, LeaveAction, StandIn,
+        accepts_routed_event, leave_action, send_with_hooks,
+    };
     use crate::config::KeyHook;
-    use input_capture::CaptureEvent;
+    use input_capture::{CaptureEvent, Position};
     use input_event::{Event, KeyboardEvent, scancode::Linux};
     use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -824,6 +965,54 @@ mod tests {
         assert!(accepts_routed_event(Some(7), 7, event));
         assert!(accepts_routed_event(None, 7, CaptureEvent::Begin));
     }
+
+    const LEFT_NEIGHBOR: u64 = 1;
+    const STAND_IN: u64 = 2;
+    const STAND_IN_RIGHT: StandIn = StandIn {
+        handle: STAND_IN,
+        pos: Position::Right,
+    };
+
+    #[test]
+    fn leave_releases_without_stand_in() {
+        let captures = [(LEFT_NEIGHBOR, Position::Left, CaptureType::Default)];
+        assert_eq!(
+            leave_action(None, &captures, LEFT_NEIGHBOR),
+            LeaveAction::Release
+        );
+    }
+
+    #[test]
+    fn stand_in_and_opposite_neighbor_hand_off_to_each_other() {
+        let captures = [
+            (LEFT_NEIGHBOR, Position::Left, CaptureType::Default),
+            (u64::MAX, Position::Left, CaptureType::EnterOnly),
+        ];
+        assert_eq!(
+            leave_action(Some(STAND_IN_RIGHT), &captures, STAND_IN),
+            LeaveAction::HandOff(LEFT_NEIGHBOR)
+        );
+        assert_eq!(
+            leave_action(Some(STAND_IN_RIGHT), &captures, LEFT_NEIGHBOR),
+            LeaveAction::HandOff(STAND_IN)
+        );
+    }
+
+    #[test]
+    fn stand_in_without_opposite_neighbor_stays() {
+        let captures = [
+            (LEFT_NEIGHBOR, Position::Top, CaptureType::Default),
+            (u64::MAX, Position::Left, CaptureType::EnterOnly),
+        ];
+        assert_eq!(
+            leave_action(Some(STAND_IN_RIGHT), &captures, STAND_IN),
+            LeaveAction::Stay
+        );
+        assert_eq!(
+            leave_action(Some(STAND_IN_RIGHT), &captures, LEFT_NEIGHBOR),
+            LeaveAction::HandOff(STAND_IN)
+        );
+    }
 }
 
 thread_local! {
@@ -861,6 +1050,29 @@ fn accepts_routed_event(
     event: CaptureEvent,
 ) -> bool {
     !matches!(event, CaptureEvent::Input(_)) || active_client == Some(handle)
+}
+
+/// Decides where input goes when `from` reports a `Leave`. Each remote
+/// returns input only across the edge facing this device, so with a stand-in
+/// the stand-in hands off to the client on that side of the local screen and
+/// every other client hands off back to the stand-in.
+fn leave_action(
+    stand_in: Option<StandIn>,
+    captures: &[(CaptureHandle, Position, CaptureType)],
+    from: CaptureHandle,
+) -> LeaveAction {
+    let Some(stand_in) = stand_in else {
+        return LeaveAction::Release;
+    };
+    if from != stand_in.handle {
+        return LeaveAction::HandOff(stand_in.handle);
+    }
+    captures
+        .iter()
+        .find(|&&(h, p, t)| {
+            h != stand_in.handle && p == stand_in.pos.opposite() && t == CaptureType::Default
+        })
+        .map_or(LeaveAction::Stay, |&(h, ..)| LeaveAction::HandOff(h))
 }
 
 struct DropGuard<T> {

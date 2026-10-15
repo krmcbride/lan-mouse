@@ -67,6 +67,8 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// whether the `stand_in` client currently replaces the local screen
+    stand_in_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -128,6 +130,7 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            stand_in_enabled: false,
         };
         Ok(service)
     }
@@ -189,6 +192,7 @@ impl Service {
             }
             FrontendRequest::Delete(handle) => {
                 self.remove_client(handle);
+                self.sync_stand_in();
                 self.save_config();
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
@@ -223,6 +227,10 @@ impl Service {
                 self.update_leave_hook(handle, leave_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::SetStandIn(enabled) => {
+                self.stand_in_enabled = enabled;
+                self.sync_stand_in();
+            }
         }
     }
 
@@ -238,6 +246,7 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                stand_in: c.stand_in,
             })
             .collect();
         self.config.set_clients(clients);
@@ -266,6 +275,7 @@ impl Service {
         self.capture.set_release_bind(release_bind);
         let key_hooks = self.config.key_hooks();
         self.capture.set_key_hooks(key_hooks);
+        self.sync_stand_in();
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -579,8 +589,28 @@ impl Service {
         if self.client_manager.set_pos(handle, pos) {
             self.deactivate_client(handle);
             self.activate_client(handle);
+            self.sync_stand_in();
         }
         self.broadcast_client(handle);
+    }
+
+    /// Hands the current stand-in target (if the mode is on) to input capture.
+    fn sync_stand_in(&mut self) {
+        let target = if self.stand_in_enabled {
+            let target = self.client_manager.stand_in_client();
+            match target {
+                Some((handle, pos)) => {
+                    log::info!("stand-in mode: client {handle} ({pos}) replaces the local screen");
+                    self.resolve(handle);
+                }
+                None => log::warn!("stand-in mode enabled, but no client sets `stand_in = true`"),
+            }
+            target
+        } else {
+            log::debug!("stand-in mode disabled");
+            None
+        };
+        self.capture.set_stand_in(target);
     }
 
     fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {

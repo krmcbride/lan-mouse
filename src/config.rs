@@ -95,6 +95,7 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    stand_in: Option<bool>,
 }
 
 impl ConfigToml {
@@ -291,6 +292,7 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    pub stand_in: bool,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -302,6 +304,7 @@ impl From<TomlClient> for ConfigClient {
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
+        let stand_in = toml.stand_in.unwrap_or(false);
         Self {
             ips,
             hostname,
@@ -310,6 +313,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            stand_in,
         }
     }
 }
@@ -330,6 +334,7 @@ impl From<ConfigClient> for TomlClient {
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
         let leave_hook = client.leave_hook;
+        let stand_in = client.stand_in.then_some(true);
         Self {
             hostname,
             host_name,
@@ -339,6 +344,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            stand_in,
         }
     }
 }
@@ -609,7 +615,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigToml, default_key_hook_timeout_ms};
+    use super::{ConfigClient, ConfigToml, TomlClient, default_key_hook_timeout_ms};
     use input_event::scancode::Linux;
 
     #[test]
@@ -647,5 +653,35 @@ mod tests {
     fn key_hooks_are_optional() {
         let config: ConfigToml = toml::from_str("").expect("empty config should parse");
         assert_eq!(config.key_hooks, None);
+    }
+
+    #[test]
+    fn stand_in_round_trips_and_defaults_off() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+                [[clients]]
+                ips = ["192.0.2.10"]
+                position = "right"
+                stand_in = true
+
+                [[clients]]
+                ips = ["192.0.2.11"]
+                position = "left"
+            "#,
+        )
+        .expect("stand-in config should parse");
+
+        let clients: Vec<ConfigClient> = config
+            .clients
+            .expect("clients should be present")
+            .into_iter()
+            .map(ConfigClient::from)
+            .collect();
+        assert!(clients[0].stand_in);
+        assert!(!clients[1].stand_in);
+
+        let written: Vec<TomlClient> = clients.into_iter().map(TomlClient::from).collect();
+        assert_eq!(written[0].stand_in, Some(true));
+        assert_eq!(written[1].stand_in, None);
     }
 }

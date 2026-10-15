@@ -46,3 +46,11 @@ enter_hook = "notify-send 'entered thorium'"
 # optional shell command run via `sh -c` when capture for this client is
 # released (release_bind chord, peer Leave, or `cli deactivate`)
 leave_hook = "notify-send 'left thorium'"
+
+# optional client that replaces this device's screen while stand-in mode is on
+# (`lan-mouse cli stand-in on`), e.g. after a KVM switches a shared monitor to
+# it. Leave it inactive when it has no screen of its own next to this device.
+[[clients]]
+position = "right"
+hostname = "cobalt"
+stand_in = true

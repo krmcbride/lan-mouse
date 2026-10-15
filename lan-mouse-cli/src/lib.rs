@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 
 use std::{net::IpAddr, time::Duration};
@@ -75,6 +75,14 @@ enum CliSubcommand {
     RemoveAuthorizedKey { sha256_fingerprint: String },
     /// save configuration to file
     SaveConfig,
+    /// let the client with `stand_in = true` replace the local screen
+    StandIn { state: Switch },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Switch {
+    On,
+    Off,
 }
 
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
@@ -172,6 +180,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 .await?
         }
         CliSubcommand::SaveConfig => tx.request(FrontendRequest::SaveConfiguration).await?,
+        CliSubcommand::StandIn { state } => {
+            tx.request(FrontendRequest::SetStandIn(state == Switch::On))
+                .await?
+        }
     }
     Ok(())
 }

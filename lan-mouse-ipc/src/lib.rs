@@ -142,6 +142,9 @@ pub struct ClientConfig {
     pub cmd: Option<String>,
     /// leave hook
     pub leave_cmd: Option<String>,
+    /// takes the local screen's place while stand-in mode is on
+    #[serde(default)]
+    pub stand_in: bool,
 }
 
 impl Default for ClientConfig {
@@ -153,6 +156,7 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            stand_in: false,
         }
     }
 }
@@ -266,6 +270,9 @@ pub enum FrontendRequest {
     UpdateLeaveHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// enable/disable stand-in mode, in which the `stand_in` client
+    /// replaces the local screen
+    SetStandIn(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

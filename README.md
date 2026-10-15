@@ -429,6 +429,14 @@ hostname = "thorium"
 ips = ["192.168.178.189", "192.168.178.172"]
 # optional port
 port = 4242
+
+# optional client that replaces this device's screen while stand-in mode is on
+# (`lan-mouse cli stand-in on`), e.g. after a KVM switches a shared monitor to
+# it. Leave it inactive when it has no screen of its own next to this device.
+[[clients]]
+position = "right"
+hostname = "cobalt"
+stand_in = true
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
@@ -442,6 +450,17 @@ capture ends. The `press` and `release` fields are independently optional.
 Hook commands should remain foreground processes; timeout cleanup only manages
 the shell process directly and cannot guarantee termination of background
 descendants.
+
+A client with `stand_in = true` can replace the local screen, for example when
+a KVM switches a shared monitor to that client while keyboard and mouse stay
+attached to this device. `lan-mouse cli stand-in on` enables the mode and
+`lan-mouse cli stand-in off` disables it; the mode is not persisted. While it is
+on, other active clients border the stand-in client instead of this device:
+leaving the stand-in client across the edge facing this device enters the
+active client on the opposite side of the local screen, and leaving any other
+client enters the stand-in client. Input never returns to the local screen
+through a remote `Leave`; the release bind still releases it. Turning the mode
+off while the stand-in client receives input releases the capture.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

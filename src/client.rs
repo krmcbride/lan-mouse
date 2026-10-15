@@ -34,6 +34,7 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            stand_in: config_client.stand_in,
         };
         let state = ClientState {
             active: config_client.active,
@@ -121,6 +122,15 @@ impl ClientManager {
                 }
             })
             .map(|p| p as ClientHandle)
+    }
+
+    /// the first client configured to stand in for the local screen
+    pub(crate) fn stand_in_client(&self) -> Option<(ClientHandle, Position)> {
+        self.clients
+            .borrow()
+            .iter()
+            .find(|(_, (c, _))| c.stand_in)
+            .map(|(k, (c, _))| (k as ClientHandle, c.pos))
     }
 
     pub(crate) fn get_hostname(&self, handle: ClientHandle) -> Option<String> {
