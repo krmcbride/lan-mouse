@@ -42,7 +42,7 @@ pub(crate) struct MacOSEmulation {
     /// click state, i.e. number of clicks in quick succession
     button_click_state: i64,
     /// current modifier state
-    modifier_state: Rc<Cell<XMods>>,
+    modifier_state: Rc<Cell<ModifierState>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
 }
@@ -73,7 +73,7 @@ impl MacOSEmulation {
             button_click_state: 0,
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
-            modifier_state: Rc::new(Cell::new(XMods::empty())),
+            modifier_state: Rc::new(Cell::new(ModifierState::default())),
         })
     }
 
@@ -181,7 +181,7 @@ fn is_arrow_key(key: u16) -> bool {
     )
 }
 
-fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
+fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: ModifierState) {
     let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
         Ok(e) => e,
         Err(_) => {
@@ -189,7 +189,7 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
             return;
         }
     };
-    let mut flags = to_cgevent_flags(modifiers);
+    let mut flags = modifiers.flags();
     // Hardware-generated arrow keys on macOS carry NumericPad + SecondaryFn.
     // CGEventTap-based hotkey matchers (e.g. tiling window managers) check
     // these flags to recognize navigation keys; without them synthesized
@@ -202,16 +202,27 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     log::trace!("key event: {key} {state}");
 }
 
-fn modifier_event(event_source: CGEventSource, depressed: XMods) {
-    let Ok(event) = CGEvent::new(event_source) else {
+/// Posts a modifier change. Like a hardware keyboard, a modifier key press or
+/// release carries the key's code and side-specific flags, which apps need to
+/// tell e.g. Right Option from Left Option; `key` is `None` for modifier
+/// changes without a key (`KeyboardEvent::Modifiers`).
+fn modifier_event(
+    event_source: CGEventSource,
+    key: Option<(CGKeyCode, bool)>,
+    modifiers: ModifierState,
+) {
+    let event = match key {
+        Some((code, down)) => CGEvent::new_keyboard_event(event_source, code, down),
+        None => CGEvent::new(event_source),
+    };
+    let Ok(event) = event else {
         log::warn!("could not create CGEvent");
         return;
     };
-    let flags = to_cgevent_flags(depressed);
     event.set_type(CGEventType::FlagsChanged);
-    event.set_flags(flags);
+    event.set_flags(modifiers.flags() | CGEventFlags::CGEventFlagNonCoalesced);
     event.post(CGEventTapLocation::HID);
-    log::trace!("modifiers updated: {depressed:?}");
+    log::trace!("modifiers updated: {modifiers:?}");
 }
 
 fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
@@ -502,7 +513,14 @@ impl Emulation for MacOSEmulation {
                     };
                     let is_modifier = update_modifiers(&self.modifier_state, key, state);
                     if is_modifier {
-                        modifier_event(self.event_source.clone(), self.modifier_state.get());
+                        // Modifier keys only change flags; hardware neither
+                        // types nor repeats them.
+                        modifier_event(
+                            self.event_source.clone(),
+                            Some((code, state != 0)),
+                            self.modifier_state.get(),
+                        );
+                        return Ok(());
                     }
                     match state {
                         // pressed
@@ -517,7 +535,7 @@ impl Emulation for MacOSEmulation {
                     group,
                 } => {
                     set_modifiers(&self.modifier_state, depressed, latched, locked, group);
-                    modifier_event(self.event_source.clone(), self.modifier_state.get());
+                    modifier_event(self.event_source.clone(), None, self.modifier_state.get());
                 }
             },
         }
@@ -532,34 +550,45 @@ impl Emulation for MacOSEmulation {
     async fn terminate(&mut self) {}
 }
 
-fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
-    if let Ok(key) = scancode::Linux::try_from(key) {
-        let mask = match key {
-            scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-            scancode::Linux::KeyCapsLock => XMods::LockMask,
-            scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-            scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
-            scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-            _ => XMods::empty(),
-        };
-        // unchanged
-        if mask.is_empty() {
-            return false;
-        }
-        let mut mods = modifiers.get();
+/// Updates the modifier state for a key event; returns whether `key` is a
+/// modifier key.
+fn update_modifiers(modifiers: &Cell<ModifierState>, key: u32, state: u8) -> bool {
+    let Ok(key) = scancode::Linux::try_from(key) else {
+        return false;
+    };
+    let mut mods = modifiers.get();
+    if key == scancode::Linux::KeyCapsLock {
         match state {
-            1 => mods.insert(mask),
-            _ => mods.remove(mask),
+            1 => mods.depressed.insert(XMods::LockMask),
+            _ => mods.depressed.remove(XMods::LockMask),
         }
-        modifiers.set(mods);
-        true
     } else {
-        false
+        let Some(&(_, side, mask)) = MODIFIER_SIDES.iter().find(|(k, ..)| *k == key) else {
+            return false;
+        };
+        match state {
+            1 => {
+                mods.sides |= side;
+                mods.depressed.insert(mask);
+            }
+            _ => {
+                mods.sides &= !side;
+                // the other side may still hold the modifier
+                let held = MODIFIER_SIDES
+                    .iter()
+                    .any(|&(_, s, m)| m == mask && mods.sides & s != 0);
+                if !held {
+                    mods.depressed.remove(mask);
+                }
+            }
+        }
     }
+    modifiers.set(mods);
+    true
 }
 
 fn set_modifiers(
-    active_modifiers: &Cell<XMods>,
+    active_modifiers: &Cell<ModifierState>,
     depressed: u32,
     latched: u32,
     locked: u32,
@@ -570,8 +599,42 @@ fn set_modifiers(
     let _locked = XMods::from_bits(locked).unwrap_or_default();
     let _group = XMods::from_bits(group).unwrap_or_default();
 
-    // we only care about the depressed modifiers for now
-    active_modifiers.replace(depressed);
+    // we only care about the depressed modifiers for now; the sides of held
+    // modifier keys are known only from key events
+    let mut mods = active_modifiers.get();
+    mods.depressed = depressed;
+    active_modifiers.set(mods);
+}
+
+/// Modifier keys with their device-dependent (side-specific) flag bits from
+/// IOLLEvent.h (`NX_DEVICE*KEYMASK`) and their X11 modifier.
+const MODIFIER_SIDES: [(scancode::Linux, u64, XMods); 8] = [
+    (scancode::Linux::KeyLeftCtrl, 0x0001, XMods::ControlMask),
+    (scancode::Linux::KeyLeftShift, 0x0002, XMods::ShiftMask),
+    (scancode::Linux::KeyRightShift, 0x0004, XMods::ShiftMask),
+    (scancode::Linux::KeyLeftMeta, 0x0008, XMods::Mod4Mask),
+    (scancode::Linux::KeyRightmeta, 0x0010, XMods::Mod4Mask),
+    (scancode::Linux::KeyLeftAlt, 0x0020, XMods::Mod1Mask),
+    (scancode::Linux::KeyRightalt, 0x0040, XMods::Mod1Mask),
+    (scancode::Linux::KeyRightCtrl, 0x2000, XMods::ControlMask),
+];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ModifierState {
+    depressed: XMods,
+    /// side-specific flag bits of the held modifier keys
+    sides: u64,
+}
+
+impl ModifierState {
+    fn flags(self) -> CGEventFlags {
+        // drop the sides of modifiers a `KeyboardEvent::Modifiers` released
+        let held_sides = MODIFIER_SIDES
+            .iter()
+            .filter(|(_, _, mask)| self.depressed.contains(*mask))
+            .fold(0, |sides, (_, side, _)| sides | side);
+        to_cgevent_flags(self.depressed) | CGEventFlags::from_bits_retain(self.sides & held_sides)
+    }
 }
 
 fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
