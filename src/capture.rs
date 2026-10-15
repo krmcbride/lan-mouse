@@ -497,6 +497,13 @@ impl CaptureTask {
             send_with_hooks(hook_dispatch, self.conn.send(event, target), run_key_hook).await;
 
         if let Err(e) = send_result {
+            // The local screen is replaced, so an unreachable neighbor
+            // returns input to the stand-in rather than to the local screen.
+            if let Some(stand_in) = send_failure_fallback(self.stand_in, target) {
+                log::warn!("client {target} is unreachable ({e}), returning to stand-in");
+                self.hand_off(capture, target, stand_in).await;
+                return Ok(());
+            }
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
             // Funnel through release_capture so the leave_hook
@@ -807,7 +814,7 @@ where
 mod tests {
     use super::{
         CaptureType, HookCommand, HookDispatch, KeyHookState, LeaveAction, StandIn,
-        accepts_routed_event, leave_action, send_with_hooks,
+        accepts_routed_event, leave_action, send_failure_fallback, send_with_hooks,
     };
     use crate::config::KeyHook;
     use input_capture::{CaptureEvent, Position};
@@ -1013,6 +1020,16 @@ mod tests {
             LeaveAction::HandOff(STAND_IN)
         );
     }
+
+    #[test]
+    fn failed_send_falls_back_to_stand_in_only_from_other_clients() {
+        assert_eq!(send_failure_fallback(None, LEFT_NEIGHBOR), None);
+        assert_eq!(
+            send_failure_fallback(Some(STAND_IN_RIGHT), LEFT_NEIGHBOR),
+            Some(STAND_IN)
+        );
+        assert_eq!(send_failure_fallback(Some(STAND_IN_RIGHT), STAND_IN), None);
+    }
 }
 
 thread_local! {
@@ -1073,6 +1090,17 @@ fn leave_action(
             h != stand_in.handle && p == stand_in.pos.opposite() && t == CaptureType::Default
         })
         .map_or(LeaveAction::Stay, |&(h, ..)| LeaveAction::HandOff(h))
+}
+
+/// Where to forward after sending to `target` failed: the stand-in, unless
+/// `target` is the stand-in itself or no stand-in is set.
+fn send_failure_fallback(
+    stand_in: Option<StandIn>,
+    target: CaptureHandle,
+) -> Option<CaptureHandle> {
+    stand_in
+        .map(|s| s.handle)
+        .filter(|&handle| handle != target)
 }
 
 struct DropGuard<T> {

@@ -459,8 +459,10 @@ on, other active clients border the stand-in client instead of this device:
 leaving the stand-in client across the edge facing this device enters the
 active client on the opposite side of the local screen, and leaving any other
 client enters the stand-in client. Input never returns to the local screen
-through a remote `Leave`; the release bind still releases it. Turning the mode
-off while the stand-in client receives input releases the capture.
+through a remote `Leave`; the release bind still releases it. If sending to
+another client fails, input returns to the stand-in client; only a failure to
+reach the stand-in client itself releases the capture. Turning the mode off
+while the stand-in client receives input releases the capture.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
